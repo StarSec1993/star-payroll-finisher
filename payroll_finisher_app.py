@@ -56,6 +56,10 @@ def process_payroll_data(df):
             shift_hours = shift['Duration']
             rate_code = shift['Payroll Item']
             
+            # Skip rows with missing/NaN duration values
+            if pd.isna(shift_hours) or shift_hours == 0:
+                continue
+            
             # Check if this is PHP (Holiday) - ESA entitlement, not worked hours
             if rate_code == 'PHP (Holiday)' or rate_code == 'PHP(Holiday)':
                 if rate_code not in php_hours:
