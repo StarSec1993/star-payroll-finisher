@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Star Security Payroll Tools - Web Application with Stat Holiday & PHP
-Tab 1: Payroll Finisher (Overtime + Stat Holidays + PHP)
+Star Security Payroll Tools v4.0 - Two-Tab Excel with Time-Based Stat Splitting
+Tab 1: Payroll Finisher (Overtime + Stat Holidays + PHP with 176-hour cap)
 Tab 2: Union Benefits Calculator
 """
 
 import streamlit as st
 import pandas as pd
 from io import BytesIO
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 import re
 
 # Page configuration
 st.set_page_config(
-    page_title="Star Security - Payroll Tools",
+    page_title="Star Security - Payroll Tools v4.0",
     page_icon="⭐",
     layout="wide"
 )
@@ -65,55 +65,214 @@ def extract_vacation_percent(notes):
     notes_str = str(notes).strip()
     
     # Look for patterns like "6%" or "6 percent"
-    match = re.search(r'(\d+)%', notes_str)
+    match = re.search(r'(\d+\.?\d*)%', notes_str)
     if match:
         return float(match.group(1)) / 100
     
-    match = re.search(r'(\d+)\s*percent', notes_str, re.IGNORECASE)
+    match = re.search(r'(\d+\.?\d*)\s*percent', notes_str, re.IGNORECASE)
     if match:
         return float(match.group(1)) / 100
     
     return 0.04  # Default 4%
 
-def split_shift_at_midnight(shift_date, shift_hours, stat_dates):
+def split_shift_with_times(shift_date, start_time, end_time, total_hours, stat_dates, times_dict=None):
     """
-    Split a shift if it crosses midnight on a stat holiday
-    Returns list of (date, hours, is_stat) tuples
+    Split a shift using actual start/end times to properly handle midnight crossings
+    
+    Args:
+        shift_date: Date shift started (pandas datetime)
+        start_time: Start time (datetime.time object or from times_dict)
+        end_time: End time (datetime.time object or from times_dict)
+        total_hours: Total hours worked
+        stat_dates: List of stat dates to check against
+        times_dict: Optional dict with times by (name, date)
+    
+    Returns:
+        List of (date, hours, is_stat) tuples
     """
     shift_segments = []
     
-    # Assume shift starts at beginning of date
-    current_time = shift_date
-    remaining_hours = shift_hours
+    # Handle missing start/end times - fall back to simple split
+    if pd.isna(start_time) or pd.isna(end_time):
+        # Simple assumption: treat all hours as on shift_date
+        is_stat = any(shift_date.date() == stat_date.date() for stat_date in stat_dates)
+        return [(shift_date.date(), total_hours, is_stat)]
     
-    while remaining_hours > 0:
-        current_date = current_time.date()
+    # Convert time objects to time if needed
+    if isinstance(start_time, dt_time):
+        start_t = start_time
+    else:
+        # Parse from string
+        try:
+            start_str = str(start_time)
+            start_hour, start_min, start_sec = map(int, start_str.split(':'))
+            start_t = dt_time(start_hour, start_min, start_sec)
+        except:
+            # Failed to parse - fall back
+            is_stat = any(shift_date.date() == stat_date.date() for stat_date in stat_dates)
+            return [(shift_date.date(), total_hours, is_stat)]
+    
+    if isinstance(end_time, dt_time):
+        end_t = end_time
+    else:
+        # Parse from string
+        try:
+            end_str = str(end_time)
+            end_hour, end_min, end_sec = map(int, end_str.split(':'))
+            end_t = dt_time(end_hour, end_min, end_sec)
+        except:
+            # Failed to parse - fall back
+            is_stat = any(shift_date.date() == stat_date.date() for stat_date in stat_dates)
+            return [(shift_date.date(), total_hours, is_stat)]
+    
+    # Create full datetime objects
+    shift_start = datetime.combine(shift_date.date(), start_t)
+    
+    # If end time is before start time, shift crosses midnight
+    if end_t < start_t:
+        # Shift ends next day
+        shift_end = datetime.combine(shift_date.date() + timedelta(days=1), end_t)
+    else:
+        # Shift ends same day
+        shift_end = datetime.combine(shift_date.date(), end_t)
+    
+    # Split at midnight if needed
+    current_datetime = shift_start
+    
+    while current_datetime < shift_end:
+        current_date = current_datetime.date()
         
-        # Hours until midnight (or end of shift)
-        hours_in_current_day = min(remaining_hours, 24)
+        # Find midnight of next day
+        next_midnight = datetime.combine(current_date + timedelta(days=1), dt_time(0, 0, 0))
         
-        # Check if current date is a stat
+        # Hours until midnight or end of shift
+        if next_midnight <= shift_end:
+            segment_end = next_midnight
+        else:
+            segment_end = shift_end
+        
+        # Calculate hours in this segment
+        segment_hours = (segment_end - current_datetime).total_seconds() / 3600
+        
+        # Check if this date is a stat
         is_stat = any(current_date == stat_date.date() for stat_date in stat_dates)
         
-        shift_segments.append((current_date, hours_in_current_day, is_stat))
+        if segment_hours > 0:
+            shift_segments.append((current_date, segment_hours, is_stat))
         
-        remaining_hours -= hours_in_current_day
-        current_time += timedelta(days=1)
+        # Move to next segment
+        current_datetime = segment_end
     
     return shift_segments
 
-def process_payroll_data_with_stats(df, period_start, period_end, stat_dates=None):
+def load_two_tab_excel(uploaded_file):
     """
-    Process payroll data with stat holiday handling and PHP calculation
-    """
-    if stat_dates is None:
-        stat_dates = []
+    Load Excel file with two tabs:
+    - Tab 1: Payroll data (main data with rate codes)
+    - Tab 2: Times (time breakdown for splitting)
     
-    # Convert stat dates to datetime
-    stat_dates = [pd.to_datetime(d) for d in stat_dates]
+    Returns: (payroll_df, times_df)
+    """
+    try:
+        # Read all sheets
+        excel_file = pd.ExcelFile(uploaded_file)
+        
+        # Get sheet names
+        sheet_names = excel_file.sheet_names
+        
+        if len(sheet_names) >= 2:
+            # Two-tab format
+            payroll_df = pd.read_excel(uploaded_file, sheet_name=0)
+            times_df = pd.read_excel(uploaded_file, sheet_name=1)
+            return payroll_df, times_df
+        else:
+            # Single tab - old format
+            payroll_df = pd.read_excel(uploaded_file, sheet_name=0)
+            return payroll_df, None
+            
+    except Exception as e:
+        st.error(f"Error reading Excel file: {str(e)}")
+        return None, None
+
+def normalize_payroll_dataframe(df):
+    """Normalize column names to standard format"""
+    # Column mapping for different export formats
+    column_mapping = {
+        'Date': 'Transaction Date',
+        'Staff_Last_First': 'Name',
+        'Actual_Total_calc': 'Duration',
+        'Project': 'Customer'
+    }
+    
+    # Rename columns if they exist
+    for old_col, new_col in column_mapping.items():
+        if old_col in df.columns and new_col not in df.columns:
+            df = df.rename(columns={old_col: new_col})
+    
+    # Add missing columns with defaults
+    if 'Service Item' not in df.columns:
+        df['Service Item'] = 'Labor'
+    if 'Class' not in df.columns:
+        df['Class'] = ''
+    if 'Billable' not in df.columns:
+        df['Billable'] = 'N'
+    if 'Notes' not in df.columns:
+        df['Notes'] = ''
     
     # Ensure Transaction Date is datetime
     df['Transaction Date'] = pd.to_datetime(df['Transaction Date'])
+    
+    return df
+
+def create_times_lookup(times_df):
+    """Create lookup dict from times dataframe"""
+    if times_df is None:
+        return {}
+    
+    times_dict = {}
+    
+    # Normalize times_df columns
+    if 'Date' in times_df.columns:
+        times_df = times_df.rename(columns={'Date': 'Transaction Date'})
+    if 'Staff_Last_First' in times_df.columns:
+        times_df = times_df.rename(columns={'Staff_Last_First': 'Name'})
+    
+    times_df['Transaction Date'] = pd.to_datetime(times_df['Transaction Date'])
+    
+    for _, row in times_df.iterrows():
+        name = row.get('Name', '')
+        date = row.get('Transaction Date')
+        start = row.get('Actual_Start')
+        end = row.get('Actual_End')
+        
+        if pd.notna(name) and pd.notna(date):
+            key = (str(name), date.date())
+            times_dict[key] = {
+                'start': start,
+                'end': end
+            }
+    
+    return times_dict
+
+def process_payroll_data_with_stats(df, times_df, period_start, period_end, stat_configs):
+    """
+    Process payroll data with stat holiday handling and PHP calculation
+    
+    Args:
+        df: Main payroll dataframe (Tab 1)
+        times_df: Times dataframe (Tab 2)
+        period_start: Payroll period start date
+        period_end: Payroll period end date
+        stat_configs: List of dicts with {stat_date, php_start, php_end}
+    """
+    # Normalize the dataframe
+    df = normalize_payroll_dataframe(df)
+    
+    # Create times lookup
+    times_dict = create_times_lookup(times_df)
+    
+    # Extract stat dates
+    stat_dates = [pd.to_datetime(config['stat_date']) for config in stat_configs]
     
     # Filter to payroll period
     period_df = df[
@@ -121,15 +280,16 @@ def process_payroll_data_with_stats(df, period_start, period_end, stat_dates=Non
         (df['Transaction Date'] <= period_end)
     ].copy()
     
-    # Get lookback data for PHP (4 weeks before each stat)
+    # Get lookback data for PHP for each stat
     lookback_data = {}
-    for stat_date in stat_dates:
-        lookback_start = stat_date - timedelta(days=28)
-        lookback_end = stat_date - timedelta(days=1)
+    for config in stat_configs:
+        stat_date = pd.to_datetime(config['stat_date'])
+        php_start = pd.to_datetime(config['php_start'])
+        php_end = pd.to_datetime(config['php_end'])
         
         lookback_df = df[
-            (df['Transaction Date'] >= lookback_start) & 
-            (df['Transaction Date'] <= lookback_end)
+            (df['Transaction Date'] >= php_start) & 
+            (df['Transaction Date'] <= php_end)
         ].copy()
         
         lookback_data[stat_date] = lookback_df
@@ -176,8 +336,19 @@ def process_payroll_data_with_stats(df, period_start, period_end, stat_dates=Non
             if 'OT' in str(rate_code) or 'STAT' in str(rate_code) or 'PHP' in str(rate_code):
                 continue
             
-            # Split shift if it crosses stat dates
-            shift_segments = split_shift_at_midnight(shift_date, shift_hours, stat_dates)
+            # Get start/end times from times_dict
+            lookup_key = (str(employee_name), shift_date.date())
+            start_time = None
+            end_time = None
+            
+            if lookup_key in times_dict:
+                start_time = times_dict[lookup_key]['start']
+                end_time = times_dict[lookup_key]['end']
+            
+            # Split shift using start/end times if available
+            shift_segments = split_shift_with_times(
+                shift_date, start_time, end_time, shift_hours, stat_dates, times_dict
+            )
             
             for seg_date, seg_hours, is_stat in shift_segments:
                 if is_stat:
@@ -229,7 +400,7 @@ def process_payroll_data_with_stats(df, period_start, period_end, stat_dates=Non
                     # Update cumulative (only non-stat hours)
                     cumulative_regular_hours += seg_hours
         
-        # Calculate PHP for this employee
+        # Calculate PHP for this employee with 176-hour cap
         php_total_hours = 0
         
         for stat_date in stat_dates:
@@ -242,7 +413,8 @@ def process_payroll_data_with_stats(df, period_start, period_end, stat_dates=Non
             if len(employee_lookback) == 0:
                 continue
             
-            # Calculate regular wages (exclude stat/OT hours from lookback)
+            # Calculate regular wages with 176-hour cap
+            total_hours = 0
             total_wages = 0
             vacation_pct = 0.04  # Default
             
@@ -254,7 +426,7 @@ def process_payroll_data_with_stats(df, period_start, period_end, stat_dates=Non
                 if pd.isna(lb_hours) or lb_hours == 0:
                     continue
                 
-                # Skip stat/OT hours in lookback
+                # Skip stat/OT hours in lookback (only count regular hours)
                 if 'OT' in str(lb_rate_code) or 'STAT' in str(lb_rate_code):
                     continue
                 
@@ -262,13 +434,28 @@ def process_payroll_data_with_stats(df, period_start, period_end, stat_dates=Non
                 rate = extract_rate_from_code(lb_rate_code)
                 vacation_pct = max(vacation_pct, extract_vacation_percent(lb_notes))
                 
-                total_wages += lb_hours * rate
+                total_hours += lb_hours
             
-            # Calculate PHP: (wages + vacation) / 20 / 30 (to get hours)
-            if total_wages > 0:
-                php_dollars = (total_wages * (1 + vacation_pct)) / 20
-                php_hours = php_dollars / 30  # Convert to hours at $30/hr
-                php_total_hours += php_hours
+            # Cap at 176 hours (88 × 2 pay periods)
+            capped_hours = min(total_hours, 176)
+            
+            # Calculate wages based on capped hours
+            # Use weighted average or primary rate
+            if capped_hours > 0:
+                # Get primary rate from most common rate code in lookback
+                rate_codes = employee_lookback[
+                    ~employee_lookback['Payroll Item'].str.contains('OT|STAT', na=False)
+                ]['Payroll Item'].mode()
+                
+                if len(rate_codes) > 0:
+                    primary_rate = extract_rate_from_code(rate_codes.iloc[0])
+                    total_wages = capped_hours * primary_rate
+                
+                # Calculate PHP: (wages + vacation) / 20 / 30 (to get hours)
+                if total_wages > 0:
+                    php_dollars = (total_wages * (1 + vacation_pct)) / 20
+                    php_hours = php_dollars / 30  # Convert to hours at $30/hr
+                    php_total_hours += php_hours
         
         # Create consolidated rows for this employee
         for rate_code, hours in regular_hours.items():
@@ -334,7 +521,8 @@ def process_payroll_data_with_stats(df, period_start, period_end, stat_dates=Non
     
     # Create output dataframe
     output_df = pd.DataFrame(processed_rows)
-    output_df = output_df.sort_values(['Name', 'Payroll Item']).reset_index(drop=True)
+    if len(output_df) > 0:
+        output_df = output_df.sort_values(['Name', 'Payroll Item']).reset_index(drop=True)
     
     return output_df, stats
 
@@ -342,8 +530,8 @@ def process_payroll_data(df):
     """
     Original process_payroll_data for non-stat periods
     """
-    # Ensure Transaction Date is datetime
-    df['Transaction Date'] = pd.to_datetime(df['Transaction Date'])
+    # Normalize the dataframe
+    df = normalize_payroll_dataframe(df)
     
     # Sort by Name and Transaction Date
     df = df.sort_values(['Name', 'Transaction Date']).reset_index(drop=True)
@@ -381,7 +569,7 @@ def process_payroll_data(df):
             if pd.isna(shift_hours) or shift_hours == 0:
                 continue
             
-            # Check if this is PHP (Holiday) - ESA entitlement, not worked hours
+            # Check if this is PHP (Holiday)
             if rate_code == 'PHP (Holiday)' or rate_code == 'PHP(Holiday)':
                 if rate_code not in php_hours:
                     php_hours[rate_code] = 0
@@ -474,7 +662,8 @@ def process_payroll_data(df):
     
     # Create output dataframe
     output_df = pd.DataFrame(processed_rows)
-    output_df = output_df.sort_values(['Name', 'Payroll Item']).reset_index(drop=True)
+    if len(output_df) > 0:
+        output_df = output_df.sort_values(['Name', 'Payroll Item']).reset_index(drop=True)
     
     return output_df, stats
 
@@ -483,8 +672,8 @@ def calculate_union_benefits(df):
     Calculate union benefits with 44-hour weekly cap
     $0.80 per hour, max 44 hours per week
     """
-    # Ensure Transaction Date is datetime
-    df['Transaction Date'] = pd.to_datetime(df['Transaction Date'])
+    # Normalize dataframe
+    df = normalize_payroll_dataframe(df)
     
     # Sort by Name and Date
     df = df.sort_values(['Name', 'Transaction Date']).reset_index(drop=True)
@@ -547,8 +736,8 @@ def to_excel(df):
 # MAIN APP
 # ============================================================================
 
-st.title("⭐ Star Security - Payroll Tools")
-st.markdown("**Professional Payroll Processing & Union Benefits Calculator**")
+st.title("⭐ Star Security - Payroll Tools v4.0")
+st.markdown("**Professional Payroll Processing with Time-Based Stat Splitting**")
 
 # Create tabs
 tab1, tab2 = st.tabs(["📊 Payroll Finisher", "💰 Union Benefits"])
@@ -566,7 +755,7 @@ with tab1:
         uploaded_file_tab1 = st.file_uploader(
             "Choose your Excel file (.xlsx)",
             type=['xlsx'],
-            help="Upload the raw payroll export (may include extra weeks for PHP lookback)",
+            help="Single tab (old format) or Two tabs: Tab 1 = Payroll, Tab 2 = Times",
             key="payroll_uploader"
         )
     
@@ -579,140 +768,190 @@ with tab1:
     
     if uploaded_file_tab1 is not None:
         try:
-            input_df = pd.read_excel(uploaded_file_tab1)
+            # Load Excel file (one or two tabs)
+            payroll_df, times_df = load_two_tab_excel(uploaded_file_tab1)
             
-            st.subheader("📄 Input Data Preview")
-            st.dataframe(input_df, use_container_width=True, height=250)
-            
-            # Stat Holiday Configuration
-            st.markdown("---")
-            st.subheader("⚙️ Payroll Configuration")
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                period_start = st.date_input(
-                    "Payroll Period START Date",
-                    value=datetime.now().date(),
-                    help="First day of the payroll period",
-                    key="period_start"
-                )
-            
-            with col2:
-                period_end = st.date_input(
-                    "Payroll Period END Date",
-                    value=(datetime.now() + timedelta(days=13)).date(),
-                    help="Last day of the payroll period",
-                    key="period_end"
-                )
-            
-            has_stat = st.checkbox(
-                "📅 This period contains Stat Holiday(s)",
-                value=False,
-                help="Check this if there are statutory holidays in this payroll period",
-                key="has_stat"
-            )
-            
-            stat_dates = []
-            if has_stat:
-                st.markdown("**Enter Stat Holiday Dates (12am-11:59pm each day):**")
+            if payroll_df is None:
+                st.error("Failed to load Excel file")
+            else:
+                # Normalize for preview
+                preview_df = normalize_payroll_dataframe(payroll_df.copy())
                 
-                num_stats = st.number_input(
-                    "Number of stat holidays in this period",
-                    min_value=1,
-                    max_value=5,
-                    value=1,
-                    help="How many stats are in this period?",
-                    key="num_stats"
-                )
+                st.subheader("📄 Input Data Preview (Tab 1)")
+                st.dataframe(preview_df.head(20), use_container_width=True, height=250)
                 
-                cols = st.columns(min(num_stats, 3))
-                for i in range(num_stats):
-                    with cols[i % 3]:
-                        stat_date = st.date_input(
-                            f"Stat #{i+1}",
-                            value=datetime.now().date(),
-                            key=f"stat_date_{i}"
-                        )
-                        stat_dates.append(stat_date)
+                if times_df is not None:
+                    with st.expander("📋 View Times Data (Tab 2)"):
+                        st.dataframe(times_df.head(20), use_container_width=True, height=200)
+                        st.success("✓ Time-based splitting enabled")
+                else:
+                    st.info("ℹ️ Single-tab format detected (no time splitting)")
                 
-                st.info(f"💡 For PHP calculation, upload data starting {(min(stat_dates) - timedelta(days=28)).strftime('%B %d, %Y')} (4 weeks before first stat)")
-            
-            st.markdown("---")
-            
-            col1, col2, col3 = st.columns([1, 1, 2])
-            with col1:
-                st.metric("Total Shifts", len(input_df))
-            with col2:
-                st.metric("Employees", input_df['Name'].nunique())
-            with col3:
-                st.metric("Total Hours", f"{input_df['Duration'].sum():.1f}")
-            
-            if st.button("🚀 Process Payroll", type="primary", use_container_width=True, key="process_payroll"):
-                with st.spinner("Processing payroll data..."):
-                    if has_stat:
-                        # Process with stat holidays and PHP
-                        output_df, stats = process_payroll_data_with_stats(
-                            input_df,
-                            pd.to_datetime(period_start),
-                            pd.to_datetime(period_end),
-                            stat_dates=[pd.to_datetime(d) for d in stat_dates]
-                        )
-                    else:
-                        # Regular processing
-                        # Filter to period
-                        period_df = input_df[
-                            (pd.to_datetime(input_df['Transaction Date']) >= pd.to_datetime(period_start)) &
-                            (pd.to_datetime(input_df['Transaction Date']) <= pd.to_datetime(period_end))
-                        ].copy()
-                        output_df, stats = process_payroll_data(period_df)
-                    
-                    st.session_state['payroll_output_df'] = output_df
-                    st.session_state['payroll_stats'] = stats
-                    st.session_state['payroll_processed'] = True
-            
-            if st.session_state.get('payroll_processed', False):
-                st.success("✅ Processing Complete!")
+                # Configuration
+                st.markdown("---")
+                st.subheader("⚙️ Payroll Configuration")
                 
-                st.subheader("📊 Summary Statistics")
-                col1, col2, col3, col4 = st.columns(4)
+                col1, col2 = st.columns(2)
                 
-                stats = st.session_state['payroll_stats']
                 with col1:
-                    st.metric("Employees", stats['employees_processed'])
+                    period_start = st.date_input(
+                        "Payroll Period START Date",
+                        value=datetime.now().date(),
+                        help="First day of the payroll period",
+                        key="period_start"
+                    )
+                
                 with col2:
-                    st.metric("Input Shifts", stats['input_shifts'])
-                with col3:
-                    st.metric("Output Lines", stats['output_lines'])
-                with col4:
-                    st.metric("Reduction", f"{100 - (stats['output_lines']/stats['input_shifts']*100):.0f}%")
+                    period_end = st.date_input(
+                        "Payroll Period END Date",
+                        value=(datetime.now() + timedelta(days=13)).date(),
+                        help="Last day of the payroll period",
+                        key="period_end"
+                    )
                 
-                cols = st.columns(4)
-                with cols[0]:
-                    st.metric("Regular Hours", f"{stats['total_regular_hours']:.1f}")
-                with cols[1]:
-                    st.metric("Overtime Hours", f"{stats['total_ot_hours']:.1f}")
-                with cols[2]:
-                    if 'total_stat_hours' in stats:
-                        st.metric("Stat Hours", f"{stats['total_stat_hours']:.1f}")
-                with cols[3]:
-                    st.metric("PHP Hours", f"{stats['total_php_hours']:.1f}")
-                
-                st.subheader("✨ Processed Output")
-                st.dataframe(st.session_state['payroll_output_df'], use_container_width=True, height=400)
-                
-                excel_data = to_excel(st.session_state['payroll_output_df'])
-                st.download_button(
-                    label="📥 Download Processed Payroll",
-                    data=excel_data,
-                    file_name=f"payroll_processed_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary",
-                    use_container_width=True,
-                    key="download_payroll"
+                has_stat = st.checkbox(
+                    "📅 This period contains Stat Holiday(s)",
+                    value=False,
+                    help="Check this if there are statutory holidays in this payroll period",
+                    key="has_stat"
                 )
                 
-                st.info("💡 Tip: The downloaded file is ready to import into QuickBooks")
+                stat_configs = []
+                
+                if has_stat:
+                    st.markdown("**Stat Holiday Configuration:**")
+                    
+                    if times_df is None:
+                        st.warning("⚠️ For accurate stat calculations at midnight, your file should have two tabs with start/end times.")
+                    
+                    num_stats = st.number_input(
+                        "Number of stat holidays in this period",
+                        min_value=1,
+                        max_value=5,
+                        value=1,
+                        help="How many stats are in this period?",
+                        key="num_stats"
+                    )
+                    
+                    for i in range(num_stats):
+                        st.markdown(f"**Stat #{i+1}:**")
+                        col1, col2, col3 = st.columns(3)
+                        
+                        with col1:
+                            stat_date = st.date_input(
+                                f"Stat Date",
+                                value=datetime.now().date(),
+                                key=f"stat_date_{i}",
+                                help="The statutory holiday date"
+                            )
+                        
+                        with col2:
+                            php_start = st.date_input(
+                                f"PHP Lookback START",
+                                value=datetime.now().date() - timedelta(days=28),
+                                key=f"php_start_{i}",
+                                help="Start of 4-week lookback period"
+                            )
+                        
+                        with col3:
+                            php_end = st.date_input(
+                                f"PHP Lookback END",
+                                value=datetime.now().date() - timedelta(days=1),
+                                key=f"php_end_{i}",
+                                help="End of 4-week lookback period"
+                            )
+                        
+                        stat_configs.append({
+                            'stat_date': stat_date,
+                            'php_start': php_start,
+                            'php_end': php_end
+                        })
+                        
+                        st.markdown("---")
+                
+                col1, col2, col3 = st.columns([1, 1, 2])
+                with col1:
+                    st.metric("Total Shifts", len(preview_df))
+                with col2:
+                    st.metric("Employees", preview_df['Name'].nunique())
+                with col3:
+                    st.metric("Total Hours", f"{preview_df['Duration'].sum():.1f}")
+                
+                if st.button("🚀 Process Payroll", type="primary", use_container_width=True, key="process_payroll"):
+                    with st.spinner("Processing payroll data..."):
+                        try:
+                            if has_stat:
+                                # Process with stat holidays and PHP
+                                output_df, stats = process_payroll_data_with_stats(
+                                    payroll_df,
+                                    times_df,
+                                    pd.to_datetime(period_start),
+                                    pd.to_datetime(period_end),
+                                    stat_configs
+                                )
+                            else:
+                                # Regular processing
+                                # Filter to period
+                                period_df = payroll_df.copy()
+                                period_df = normalize_payroll_dataframe(period_df)
+                                period_df = period_df[
+                                    (period_df['Transaction Date'] >= pd.to_datetime(period_start)) &
+                                    (period_df['Transaction Date'] <= pd.to_datetime(period_end))
+                                ].copy()
+                                output_df, stats = process_payroll_data(period_df)
+                            
+                            st.session_state['payroll_output_df'] = output_df
+                            st.session_state['payroll_stats'] = stats
+                            st.session_state['payroll_processed'] = True
+                        
+                        except Exception as e:
+                            st.error(f"❌ Error during processing: {str(e)}")
+                            import traceback
+                            st.code(traceback.format_exc())
+                
+                if st.session_state.get('payroll_processed', False):
+                    st.success("✅ Processing Complete!")
+                    
+                    st.subheader("📊 Summary Statistics")
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    stats = st.session_state['payroll_stats']
+                    with col1:
+                        st.metric("Employees", stats['employees_processed'])
+                    with col2:
+                        st.metric("Input Shifts", stats['input_shifts'])
+                    with col3:
+                        st.metric("Output Lines", stats['output_lines'])
+                    with col4:
+                        reduction = 100 - (stats['output_lines']/max(stats['input_shifts'], 1)*100)
+                        st.metric("Reduction", f"{reduction:.0f}%")
+                    
+                    cols = st.columns(4)
+                    with cols[0]:
+                        st.metric("Regular Hours", f"{stats['total_regular_hours']:.1f}")
+                    with cols[1]:
+                        st.metric("Overtime Hours", f"{stats['total_ot_hours']:.1f}")
+                    with cols[2]:
+                        if 'total_stat_hours' in stats:
+                            st.metric("Stat Hours", f"{stats['total_stat_hours']:.1f}")
+                    with cols[3]:
+                        st.metric("PHP Hours", f"{stats['total_php_hours']:.1f}")
+                    
+                    st.subheader("✨ Processed Output")
+                    st.dataframe(st.session_state['payroll_output_df'], use_container_width=True, height=400)
+                    
+                    excel_data = to_excel(st.session_state['payroll_output_df'])
+                    st.download_button(
+                        label="📥 Download Processed Payroll",
+                        data=excel_data,
+                        file_name=f"payroll_processed_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        type="primary",
+                        use_container_width=True,
+                        key="download_payroll"
+                    )
+                    
+                    st.info("💡 Tip: The downloaded file is ready to import into QuickBooks")
         
         except Exception as e:
             st.error(f"❌ Error processing file: {str(e)}")
@@ -746,10 +985,12 @@ with tab2:
     
     if uploaded_file_tab2 is not None:
         try:
-            input_df_union = pd.read_excel(uploaded_file_tab2)
+            # Load first tab only
+            payroll_df, _ = load_two_tab_excel(uploaded_file_tab2)
+            input_df_union = normalize_payroll_dataframe(payroll_df)
             
             st.subheader("📄 Input Data Preview")
-            st.dataframe(input_df_union, use_container_width=True, height=250)
+            st.dataframe(input_df_union.head(20), use_container_width=True, height=250)
             
             col1, col2, col3 = st.columns(3)
             with col1:
@@ -811,36 +1052,39 @@ with tab2:
         
         except Exception as e:
             st.error(f"❌ Error processing file: {str(e)}")
+            import traceback
+            st.code(traceback.format_exc())
 
 # Sidebar info
 with st.sidebar:
     st.header("📋 About")
     st.markdown("""
-    **Star Security Payroll Tools v3.0**
+    **Star Security Payroll Tools v4.0**
     
     **Tab 1: Payroll Finisher**
-    - Processes overtime at 88 hours
+    - Two-tab Excel support
+    - Time-based midnight splitting
     - Stat holiday premium pay (1.5x)
-    - PHP (Public Holiday Pay) calculation
-    - Stat hours excluded from OT
-    - Handles multiple pay rates
+    - PHP with 176-hour cap
+    - Manual PHP date entry
+    - Handles consecutive stats
     - QuickBooks ready
     
     **Tab 2: Union Benefits**
-    - Calculates union contributions
     - $0.80 per hour worked
     - Max 44 hours per week
     - Split by Week 1 & Week 2
     
     ---
     
-    **Stat Holiday Features:**
-    - 12am-11:59pm premium pay
-    - Automatic shift splitting
-    - 4-week PHP lookback
-    - Custom vacation % support
+    **New in v4.0:**
+    - ✨ Two-tab Excel format
+    - ✨ Precise time-based splitting
+    - ✨ 176-hour PHP cap (ESA compliant)
+    - ✨ Manual PHP lookback dates
+    - ✨ Handles any shift crossing midnight
     
     ---
     
-    Star Security Inc. | Enhanced
+    Star Security Inc. | v4.0
     """)
