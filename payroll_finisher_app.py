@@ -167,11 +167,12 @@ def split_shift_with_times(shift_date, start_time, end_time, total_hours, stat_d
 
 def load_two_tab_excel(uploaded_file):
     """
-    Load Excel file with two tabs:
-    - Tab 1: Payroll data (main data with rate codes)
-    - Tab 2: Times (time breakdown for splitting)
+    Load Excel file with two or three tabs:
+    - Tab 1: Payroll data (current period)
+    - Tab 2: Times (time breakdown for splitting + PHP hours)
+    - Tab 3 (optional): Past Payroll (for rate code lookup)
     
-    Returns: (payroll_df, times_df)
+    Returns: (payroll_df, times_df, past_payroll_df)
     """
     try:
         # Read all sheets
@@ -180,19 +181,25 @@ def load_two_tab_excel(uploaded_file):
         # Get sheet names
         sheet_names = excel_file.sheet_names
         
-        if len(sheet_names) >= 2:
-            # Two-tab format
+        if len(sheet_names) >= 3:
+            # Three-tab format (current payroll, times, past payroll)
             payroll_df = pd.read_excel(uploaded_file, sheet_name=0)
             times_df = pd.read_excel(uploaded_file, sheet_name=1)
-            return payroll_df, times_df
+            past_payroll_df = pd.read_excel(uploaded_file, sheet_name=2)
+            return payroll_df, times_df, past_payroll_df
+        elif len(sheet_names) >= 2:
+            # Two-tab format (payroll, times)
+            payroll_df = pd.read_excel(uploaded_file, sheet_name=0)
+            times_df = pd.read_excel(uploaded_file, sheet_name=1)
+            return payroll_df, times_df, None
         else:
             # Single tab - old format
             payroll_df = pd.read_excel(uploaded_file, sheet_name=0)
-            return payroll_df, None
+            return payroll_df, None, None
             
     except Exception as e:
         st.error(f"Error reading Excel file: {str(e)}")
-        return None, None
+        return None, None, None
 
 def normalize_payroll_dataframe(df):
     """Normalize column names to standard format"""
@@ -254,16 +261,17 @@ def create_times_lookup(times_df):
     
     return times_dict
 
-def process_payroll_data_with_stats(df, times_df, period_start, period_end, stat_configs):
+def process_payroll_data_with_stats(df, times_df, period_start, period_end, stat_configs, past_payroll_df=None):
     """
     Process payroll data with stat holiday handling and PHP calculation
     
     Args:
-        df: Main payroll dataframe (Tab 1)
-        times_df: Times dataframe (Tab 2)
+        df: Main payroll dataframe (Tab 1 - current period)
+        times_df: Times dataframe (Tab 2 - for PHP hours and stat splitting)
         period_start: Payroll period start date
         period_end: Payroll period end date
         stat_configs: List of dicts with {stat_date, php_start, php_end}
+        past_payroll_df: Optional past payroll dataframe (Tab 3 - for rate lookup)
     """
     # Normalize the dataframe
     df = normalize_payroll_dataframe(df)
@@ -335,13 +343,45 @@ def process_payroll_data_with_stats(df, times_df, period_start, period_end, stat
                         'Notes': notes
                     })
                 else:
-                    # Employee not in payroll period - add to warnings
-                    # This happens when employee is on vacation during payroll period
-                    warning_key = f"{employee_name}|{stat_date.date()}"
-                    if warning_key not in php_warnings:
-                        php_warnings.append(warning_key)
-                    # Skip this employee for PHP calculation
-                    continue
+                    # Employee not in current payroll period
+                    # Try to find rate code in past payroll (Tab 3)
+                    rate_code = None
+                    notes = ''
+                    
+                    if past_payroll_df is not None:
+                        # Normalize past payroll if needed
+                        if 'Name' not in past_payroll_df.columns:
+                            past_payroll_df = normalize_payroll_dataframe(past_payroll_df)
+                        
+                        # Look for employee in past payroll
+                        employee_past = past_payroll_df[past_payroll_df['Name'] == employee_name]
+                        
+                        if len(employee_past) > 0:
+                            # Get most common rate code from past payroll
+                            regular_rates = employee_past[
+                                ~employee_past['Payroll Item'].astype(str).str.contains('OT|STAT', na=False)
+                            ]['Payroll Item']
+                            
+                            if len(regular_rates) > 0:
+                                rate_code = regular_rates.mode().iloc[0] if len(regular_rates.mode()) > 0 else regular_rates.iloc[0]
+                                notes = employee_past['Notes'].iloc[0] if 'Notes' in employee_past.columns else '4%'
+                    
+                    if rate_code is not None:
+                        # Found rate in past payroll - add to lookback data
+                        lookback_rows.append({
+                            'Name': employee_name,
+                            'Transaction Date': shift_date,
+                            'Duration': hours,
+                            'Payroll Item': rate_code,
+                            'Notes': notes
+                        })
+                    else:
+                        # Employee not in current OR past payroll - add to warnings
+                        warning_key = f"{employee_name}|{stat_date.date()}"
+                        if warning_key not in php_warnings:
+                            php_warnings.append(warning_key)
+                        # Skip this employee for PHP calculation
+                        continue
             
             lookback_df = pd.DataFrame(lookback_rows)
         else:
@@ -817,7 +857,7 @@ with tab1:
         uploaded_file_tab1 = st.file_uploader(
             "Choose your Excel file (.xlsx)",
             type=['xlsx'],
-            help="Single tab (old format) or Two tabs: Tab 1 = Payroll, Tab 2 = Times",
+            help="Tab 1 = Current Payroll (required), Tab 2 = Times for PHP & Stat Splitting (optional), Tab 3 = Past Payroll for Rate Lookup (optional)",
             key="payroll_uploader"
         )
     
@@ -831,7 +871,7 @@ with tab1:
     if uploaded_file_tab1 is not None:
         try:
             # Load Excel file (one or two tabs)
-            payroll_df, times_df = load_two_tab_excel(uploaded_file_tab1)
+            payroll_df, times_df, past_payroll_df = load_two_tab_excel(uploaded_file_tab1)
             
             if payroll_df is None:
                 st.error("Failed to load Excel file")
@@ -848,6 +888,12 @@ with tab1:
                         st.success("✓ Time-based splitting enabled")
                 else:
                     st.info("ℹ️ Single-tab format detected (no time splitting)")
+                
+                if past_payroll_df is not None:
+                    with st.expander("📂 View Past Payroll (Tab 3 - Rate Lookup)"):
+                        past_preview = normalize_payroll_dataframe(past_payroll_df.copy())
+                        st.dataframe(past_preview.head(20), use_container_width=True, height=200)
+                        st.success(f"✓ Past payroll loaded ({past_preview['Name'].nunique()} employees) - will be used for PHP rate lookup")
                 
                 # Configuration
                 st.markdown("---")
@@ -949,7 +995,8 @@ with tab1:
                                     times_df,
                                     pd.to_datetime(period_start),
                                     pd.to_datetime(period_end),
-                                    stat_configs
+                                    stat_configs,
+                                    past_payroll_df
                                 )
                             else:
                                 # Regular processing
@@ -1065,8 +1112,8 @@ with tab2:
     
     if uploaded_file_tab2 is not None:
         try:
-            # Load first tab only
-            payroll_df, _ = load_two_tab_excel(uploaded_file_tab2)
+            # Load first tab only (ignore tabs 2 and 3 if present)
+            payroll_df, _, _ = load_two_tab_excel(uploaded_file_tab2)
             input_df_union = normalize_payroll_dataframe(payroll_df)
             
             st.subheader("📄 Input Data Preview")
