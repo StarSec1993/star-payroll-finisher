@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Star Security Payroll Tools v4.5 - Two-Tab Excel with Time-Based Stat Splitting
+Star Security Payroll Tools v4.6 - Two-Tab Excel with Time-Based Stat Splitting
 Tab 1: Payroll Finisher (Overtime + Stat Holidays + PHP with 176-hour cap)
 Tab 2: Union Benefits Calculator
 """
@@ -232,33 +232,25 @@ def normalize_payroll_dataframe(df):
     return df
 
 def create_times_lookup(times_df):
-    """Create lookup dict from times dataframe"""
+    """Create lookup dict — supports multiple shifts per (name, date)"""
     if times_df is None:
         return {}
-    
     times_dict = {}
-    
-    # Normalize times_df columns
     if 'Date' in times_df.columns:
         times_df = times_df.rename(columns={'Date': 'Transaction Date'})
     if 'Staff_Last_First' in times_df.columns:
         times_df = times_df.rename(columns={'Staff_Last_First': 'Name'})
-    
     times_df['Transaction Date'] = pd.to_datetime(times_df['Transaction Date'])
-    
     for _, row in times_df.iterrows():
         name = row.get('Name', '')
         date = row.get('Transaction Date')
         start = row.get('Actual_Start')
         end = row.get('Actual_End')
-        
-        if pd.notna(name) and pd.notna(date):
+        if pd.notna(name) and pd.notna(date) and pd.notna(start) and pd.notna(end):
             key = (str(name), date.date())
-            times_dict[key] = {
-                'start': start,
-                'end': end
-            }
-    
+            if key not in times_dict:
+                times_dict[key] = []
+            times_dict[key].append({'start': start, 'end': end})
     return times_dict
 
 def process_payroll_data_with_stats(df, times_df, period_start, period_end, stat_configs, php_lookback_df=None):
@@ -353,14 +345,17 @@ def process_payroll_data_with_stats(df, times_df, period_start, period_end, stat
                 continue
             if 'OT' in str(rate_code) or 'STAT' in str(rate_code) or 'PHP' in str(rate_code):
                 continue
-            # Tab 2 lookup - only for midnight splitting
+            # Tab 2 lookup - handle multiple shifts per day
             lookup_key = (str(employee_name), shift_date.date())
-            start_time = None
-            end_time = None
+            shift_segments = []
             if lookup_key in times_dict:
-                start_time = times_dict[lookup_key]['start']
-                end_time = times_dict[lookup_key]['end']
-            shift_segments = split_shift_with_times(shift_date, start_time, end_time, shift_hours, stat_dates, times_dict)
+                for time_entry in times_dict[lookup_key]:
+                    segs = split_shift_with_times(shift_date, time_entry['start'], time_entry['end'], time_entry['end'], stat_dates, times_dict)
+                    shift_segments.extend(segs)
+                if not shift_segments:
+                    shift_segments = [(shift_date.date(), shift_hours, any(shift_date.date() == sd.date() for sd in stat_dates))]
+            else:
+                shift_segments = split_shift_with_times(shift_date, None, None, shift_hours, stat_dates, times_dict)
             for seg_date, seg_hours, is_stat in shift_segments:
                 if is_stat:
                     ot_stat_code = get_ot_stat_code(rate_code)
@@ -708,7 +703,7 @@ def to_excel(df):
 # MAIN APP
 # ============================================================================
 
-st.title("⭐ Star Security - Payroll Tools v4.5")
+st.title("⭐ Star Security - Payroll Tools v4.6")
 st.markdown("**Professional Payroll Processing with Time-Based Stat Splitting**")
 
 # Create tabs
@@ -1056,7 +1051,7 @@ with tab2:
 with st.sidebar:
     st.header("📋 About")
     st.markdown("""
-    **Star Security Payroll Tools v4.5**
+    **Star Security Payroll Tools v4.6**
     
     **Tab 1: Payroll Finisher**
     - Two-tab Excel support
@@ -1083,5 +1078,5 @@ with st.sidebar:
     
     ---
     
-    Star Security Inc. | v4.5
+    Star Security Inc. | v4.6
     """)
