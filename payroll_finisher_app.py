@@ -919,7 +919,7 @@ with tab1:
                     
                     # Display PHP warnings if any
                     if 'php_warnings' in stats and len(stats['php_warnings']) > 0:
-                        st.warning(f"⚠️ {len(stats['php_warnings'])} employees worked in lookback but NOT in current period — PHP has been calculated and included. Review list and remove any not entitled before uploading to QuickBooks.")
+                        st.info(f"ℹ️ PHP included for {len(stats['php_warnings'])} employees who worked in the lookback period but not in the current period. Review before QuickBooks upload.")
                         with st.expander(f"📋 View {len(stats['php_warnings'])} Employees Missing PHP"):
                             warning_text = "**These employees worked during the PHP lookback period but are NOT in the current payroll period.**\n\n"
                             warning_text += "**Possible reasons:**\n"
