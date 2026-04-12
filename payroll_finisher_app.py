@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Star Security Payroll Tools v4.0 - Two-Tab Excel with Time-Based Stat Splitting
+Star Security Payroll Tools v4.5 - Two-Tab Excel with Time-Based Stat Splitting
 Tab 1: Payroll Finisher (Overtime + Stat Holidays + PHP with 176-hour cap)
 Tab 2: Union Benefits Calculator
 """
@@ -444,10 +444,58 @@ def process_payroll_data_with_stats(df, times_df, period_start, period_end, stat
             stats['output_lines'] += 1
             stats['total_php_hours'] += php_total_hours
 
+    # ── PHP for employees in lookback but NOT in current period ──────────────
+    # These employees are entitled to PHP — use their rate from Tab 3 lookback data
+    php_date = min([sd for sd in stat_dates if period_start <= sd <= period_end]) if stat_dates else None
+    period_names = set(period_df['Name'].unique())
+    for stat_date in stat_dates:
+        if stat_date not in lookback_data:
+            continue
+        lookback_df = lookback_data[stat_date]
+        if lookback_df is None or len(lookback_df) == 0:
+            continue
+        lookback_only = set(lookback_df['Name'].unique()) - period_names
+        for employee_name in sorted(lookback_only):
+            employee_lookback = lookback_df[lookback_df['Name'] == employee_name].copy()
+            if len(employee_lookback) == 0:
+                continue
+            total_hours = 0
+            vacation_pct = 0.04
+            for _, lb_shift in employee_lookback.iterrows():
+                lb_hours = lb_shift['Duration']
+                lb_notes = lb_shift.get('Notes', '')
+                if pd.isna(lb_hours) or lb_hours == 0:
+                    continue
+                vacation_pct = max(vacation_pct, extract_vacation_percent(lb_notes))
+                total_hours += lb_hours
+            capped_hours = min(total_hours, 176)
+            if capped_hours > 0:
+                rate_codes = employee_lookback[
+                    ~employee_lookback['Payroll Item'].str.contains('OT|STAT', na=False)
+                ]['Payroll Item'].mode()
+                if len(rate_codes) > 0:
+                    primary_rate = extract_rate_from_code(rate_codes.iloc[0])
+                    total_wages = capped_hours * primary_rate
+                    if total_wages > 0 and php_date:
+                        php_dollars = (total_wages * (1 + vacation_pct)) / 20
+                        php_hours = php_dollars / 30
+                        processed_rows.append({
+                            'Name': employee_name,
+                            'Transaction Date': php_date,
+                            'Customer': 'STAR TOTAL',
+                            'Service Item': 'Labor',
+                            'Payroll Item': 'PHP (Holiday)',
+                            'Duration': round(php_hours, 2),
+                            'Class': '', 'Billable': 'N', 'Notes': ''
+                        })
+                        stats['output_lines'] += 1
+                        stats['total_php_hours'] += php_hours
+
     output_df = pd.DataFrame(processed_rows)
     if len(output_df) > 0:
         output_df = output_df.sort_values(['Name', 'Payroll Item']).reset_index(drop=True)
-    stats['php_warnings'] = php_warnings
+    # Clear warnings since we now calculate PHP for all eligible employees
+    stats['php_warnings'] = []
     return output_df, stats
 
 
@@ -661,7 +709,7 @@ def to_excel(df):
 # MAIN APP
 # ============================================================================
 
-st.title("⭐ Star Security - Payroll Tools v4.4")
+st.title("⭐ Star Security - Payroll Tools v4.5")
 st.markdown("**Professional Payroll Processing with Time-Based Stat Splitting**")
 
 # Create tabs
@@ -871,7 +919,7 @@ with tab1:
                     
                     # Display PHP warnings if any
                     if 'php_warnings' in stats and len(stats['php_warnings']) > 0:
-                        st.warning(f"⚠️ {len(stats['php_warnings'])} employees worked in lookback but NOT in payroll period - PHP could not be calculated")
+                        st.warning(f"⚠️ {len(stats['php_warnings'])} employees worked in lookback but NOT in current period — PHP has been calculated and included. Review list and remove any not entitled before uploading to QuickBooks.")
                         with st.expander(f"📋 View {len(stats['php_warnings'])} Employees Missing PHP"):
                             warning_text = "**These employees worked during the PHP lookback period but are NOT in the current payroll period.**\n\n"
                             warning_text += "**Possible reasons:**\n"
@@ -1009,7 +1057,7 @@ with tab2:
 with st.sidebar:
     st.header("📋 About")
     st.markdown("""
-    **Star Security Payroll Tools v4.4**
+    **Star Security Payroll Tools v4.5**
     
     **Tab 1: Payroll Finisher**
     - Two-tab Excel support
@@ -1036,5 +1084,5 @@ with st.sidebar:
     
     ---
     
-    Star Security Inc. | v4.4
+    Star Security Inc. | v4.5
     """)
