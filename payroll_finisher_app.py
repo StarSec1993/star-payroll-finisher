@@ -172,7 +172,7 @@ def load_two_tab_excel(uploaded_file):
     - Tab 2: Times (time breakdown for splitting + PHP hours)
     - Tab 3 (optional): Past Payroll (for rate code lookup)
     
-    Returns: (payroll_df, times_df, past_payroll_df)
+    Returns: (payroll_df, times_df, php_lookback_df)
     """
     try:
         # Read all sheets
@@ -185,8 +185,8 @@ def load_two_tab_excel(uploaded_file):
             # Three-tab format (current payroll, times, past payroll)
             payroll_df = pd.read_excel(uploaded_file, sheet_name=0)
             times_df = pd.read_excel(uploaded_file, sheet_name=1)
-            past_payroll_df = pd.read_excel(uploaded_file, sheet_name=2)
-            return payroll_df, times_df, past_payroll_df
+            php_lookback_df = pd.read_excel(uploaded_file, sheet_name=2)
+            return payroll_df, times_df, php_lookback_df
         elif len(sheet_names) >= 2:
             # Two-tab format (payroll, times)
             payroll_df = pd.read_excel(uploaded_file, sheet_name=0)
@@ -261,372 +261,195 @@ def create_times_lookup(times_df):
     
     return times_dict
 
-def process_payroll_data_with_stats(df, times_df, period_start, period_end, stat_configs, past_payroll_df=None):
+def process_payroll_data_with_stats(df, times_df, period_start, period_end, stat_configs, php_lookback_df=None):
     """
-    Process payroll data with stat holiday handling and PHP calculation
-    
-    Args:
-        df: Main payroll dataframe (Tab 1 - current period)
-        times_df: Times dataframe (Tab 2 - for PHP hours and stat splitting)
-        period_start: Payroll period start date
-        period_end: Payroll period end date
-        stat_configs: List of dicts with {stat_date, php_start, php_end}
-        past_payroll_df: Optional past payroll dataframe (Tab 3 - for rate lookup)
+    Process payroll with stat holiday handling.
+
+    Tab 1 (df):           Current payroll - Name, Transaction Date, Payroll Item, Duration, Notes
+    Tab 2 (times_df):     ONLY overnight shifts around stat - Name, Date, Actual_Start, Actual_End
+                          Used ONLY for midnight splitting. Small file.
+    Tab 3 (php_lookback_df): PHP lookback data - 2 previous periods
+                          Same format as Tab 1 - Name, Transaction Date, Payroll Item, Duration, Notes
+                          Filtered by php_start/php_end dates entered in the UI
     """
-    # Normalize the dataframe
     df = normalize_payroll_dataframe(df)
-    
-    # Create times lookup
+
+    # Tab 2: build times lookup for midnight splitting ONLY
     times_dict = create_times_lookup(times_df)
-    
-    # Extract stat dates
+
+    # Normalize Tab 3 (PHP lookback) if provided
+    if php_lookback_df is not None:
+        php_lookback_df = normalize_payroll_dataframe(php_lookback_df.copy())
+
     stat_dates = [pd.to_datetime(config['stat_date']) for config in stat_configs]
-    
-    # Filter to payroll period
+
+    # Filter Tab 1 to payroll period
     period_df = df[
-        (df['Transaction Date'] >= period_start) & 
+        (df['Transaction Date'] >= period_start) &
         (df['Transaction Date'] <= period_end)
     ].copy()
-    
-    # Get lookback data for PHP for each stat
-    # CRITICAL: Use times_df (has full date range) instead of df (payroll period only)
+
+    # Build lookback data for each stat using Tab 3
     lookback_data = {}
-    php_warnings = []  # Track employees who couldn't be matched
-    
+    php_warnings = []
+
     for config in stat_configs:
         stat_date = pd.to_datetime(config['stat_date'])
         php_start = pd.to_datetime(config['php_start'])
         php_end = pd.to_datetime(config['php_end'])
-        
-        # Use times_df for lookback (has Jan 19 - Feb 26 full range)
-        if times_df is not None:
-            lookback_times = times_df[
-                (times_df['Date'] >= php_start) & 
-                (times_df['Date'] <= php_end)
+
+        if php_lookback_df is not None:
+            # Filter Tab 3 to the PHP lookback window - already has Name, Date, Payroll Item, Duration, Notes
+            lookback_df = php_lookback_df[
+                (php_lookback_df['Transaction Date'] >= php_start) &
+                (php_lookback_df['Transaction Date'] <= php_end)
             ].copy()
-            
-            # Convert times_df format to match payroll format
-            # We need: Name, Transaction Date, Duration, Payroll Item (rate code)
-            lookback_rows = []
-            
-            for _, time_row in lookback_times.iterrows():
-                employee_name = time_row['Staff_Last_First']
-                shift_date = time_row['Date']
-                hours = time_row['Actual_Total_calc']
-                
-                # Find this employee's rate code from period_df (payroll data)
-                # Use their most common rate code from the payroll period
-                employee_payroll = period_df[period_df['Name'] == employee_name]
-                
-                if len(employee_payroll) > 0:
-                    # Get most common rate code (excluding OT/STAT)
-                    regular_rates = employee_payroll[
-                        ~employee_payroll['Payroll Item'].astype(str).str.contains('OT|STAT', na=False)
-                    ]['Payroll Item']
-                    
-                    if len(regular_rates) > 0:
-                        # Use mode (most common rate)
-                        rate_code = regular_rates.mode().iloc[0] if len(regular_rates.mode()) > 0 else regular_rates.iloc[0]
-                    else:
-                        # Fallback to any rate
-                        rate_code = employee_payroll['Payroll Item'].iloc[0]
-                    
-                    # Get notes (vacation %) from payroll
-                    notes = employee_payroll['Notes'].iloc[0] if 'Notes' in employee_payroll.columns else ''
-                    
-                    # Add to lookback data
-                    lookback_rows.append({
-                        'Name': employee_name,
-                        'Transaction Date': shift_date,
-                        'Duration': hours,
-                        'Payroll Item': rate_code,
-                        'Notes': notes
-                    })
-                else:
-                    # Employee not in current payroll period
-                    # Try to find rate code in past payroll (Tab 3)
-                    rate_code = None
-                    notes = ''
-                    
-                    if past_payroll_df is not None:
-                        # Normalize past payroll if needed
-                        if 'Name' not in past_payroll_df.columns:
-                            past_payroll_df = normalize_payroll_dataframe(past_payroll_df)
-                        
-                        # Look for employee in past payroll
-                        employee_past = past_payroll_df[past_payroll_df['Name'] == employee_name]
-                        
-                        if len(employee_past) > 0:
-                            # Get most common rate code from past payroll
-                            regular_rates = employee_past[
-                                ~employee_past['Payroll Item'].astype(str).str.contains('OT|STAT', na=False)
-                            ]['Payroll Item']
-                            
-                            if len(regular_rates) > 0:
-                                rate_code = regular_rates.mode().iloc[0] if len(regular_rates.mode()) > 0 else regular_rates.iloc[0]
-                                notes = employee_past['Notes'].iloc[0] if 'Notes' in employee_past.columns else '4%'
-                    
-                    if rate_code is not None:
-                        # Found rate in past payroll - add to lookback data
-                        lookback_rows.append({
-                            'Name': employee_name,
-                            'Transaction Date': shift_date,
-                            'Duration': hours,
-                            'Payroll Item': rate_code,
-                            'Notes': notes
-                        })
-                    else:
-                        # Employee not in current OR past payroll - add to warnings
-                        warning_key = f"{employee_name}|{stat_date.date()}"
-                        if warning_key not in php_warnings:
-                            php_warnings.append(warning_key)
-                        # Skip this employee for PHP calculation
-                        continue
-            
-            lookback_df = pd.DataFrame(lookback_rows)
+
+            # Only keep regular hours (exclude OT/STAT rows)
+            lookback_df = lookback_df[
+                ~lookback_df['Payroll Item'].astype(str).str.contains('OT|STAT|PHP', na=False)
+            ].copy()
+
+            # Warn on employees in lookback but not in current period
+            lookback_names = set(lookback_df['Name'].unique())
+            period_names = set(period_df['Name'].unique())
+            for name in lookback_names - period_names:
+                warning_key = f"{name}|{stat_date.date()}"
+                if warning_key not in php_warnings:
+                    php_warnings.append(warning_key)
+
         else:
-            # Fallback to old method if no times_df provided
-            lookback_df = df[
-                (df['Transaction Date'] >= php_start) & 
-                (df['Transaction Date'] <= php_end)
+            # No Tab 3 - fall back to Tab 1 data for PHP (limited to current period)
+            lookback_df = period_df[
+                (period_df['Transaction Date'] >= php_start) &
+                (period_df['Transaction Date'] <= php_end)
             ].copy()
-        
+
         lookback_data[stat_date] = lookback_df
-    
-    # Sort by Name and Transaction Date
+
     period_df = period_df.sort_values(['Name', 'Transaction Date']).reset_index(drop=True)
-    
-    # Process each employee
     processed_rows = []
     stats = {
-        'employees_processed': 0,
-        'input_shifts': len(period_df),
-        'output_lines': 0,
-        'total_regular_hours': 0,
-        'total_ot_hours': 0,
-        'total_stat_hours': 0,
-        'total_php_hours': 0
+        'employees_processed': 0, 'input_shifts': len(period_df),
+        'output_lines': 0, 'total_regular_hours': 0,
+        'total_ot_hours': 0, 'total_stat_hours': 0, 'total_php_hours': 0
     }
-    
+
     for employee_name in period_df['Name'].unique():
         stats['employees_processed'] += 1
-        
-        # Get all shifts for this employee in the period
         employee_shifts = period_df[period_df['Name'] == employee_name].copy()
         employee_shifts = employee_shifts.sort_values('Transaction Date').reset_index(drop=True)
-        
-        # Track hours by type
-        cumulative_regular_hours = 0  # Only non-stat hours count toward OT
+        cumulative_regular_hours = 0
         regular_hours = {}
         overtime_hours = {}
         stat_hours = {}
         first_date = employee_shifts['Transaction Date'].iloc[0]
-        
+
         for idx, shift in employee_shifts.iterrows():
             shift_hours = shift['Duration']
             rate_code = shift['Payroll Item']
             shift_date = shift['Transaction Date']
-            
-            # Skip NaN/0 duration
             if pd.isna(shift_hours) or shift_hours == 0:
                 continue
-            
-            # Skip if already marked as OT/STAT or PHP
             if 'OT' in str(rate_code) or 'STAT' in str(rate_code) or 'PHP' in str(rate_code):
                 continue
-            
-            # Get start/end times from times_dict
+            # Tab 2 lookup - only for midnight splitting
             lookup_key = (str(employee_name), shift_date.date())
             start_time = None
             end_time = None
-            
             if lookup_key in times_dict:
                 start_time = times_dict[lookup_key]['start']
                 end_time = times_dict[lookup_key]['end']
-            
-            # Split shift using start/end times if available
-            shift_segments = split_shift_with_times(
-                shift_date, start_time, end_time, shift_hours, stat_dates, times_dict
-            )
-            
+            shift_segments = split_shift_with_times(shift_date, start_time, end_time, shift_hours, stat_dates, times_dict)
             for seg_date, seg_hours, is_stat in shift_segments:
                 if is_stat:
-                    # Stat premium hours - already 1.5x, don't count toward OT
                     ot_stat_code = get_ot_stat_code(rate_code)
                     if ot_stat_code not in stat_hours:
                         stat_hours[ot_stat_code] = 0
                     stat_hours[ot_stat_code] += seg_hours
                     stats['total_stat_hours'] += seg_hours
-                    
                 else:
-                    # Regular hours - check against 88-hour threshold
                     hours_before = cumulative_regular_hours
                     hours_after = cumulative_regular_hours + seg_hours
-                    
                     if hours_after <= 88:
-                        # All regular
                         if rate_code not in regular_hours:
                             regular_hours[rate_code] = 0
                         regular_hours[rate_code] += seg_hours
                         stats['total_regular_hours'] += seg_hours
-                        
                     elif hours_before >= 88:
-                        # All overtime
                         ot_code = get_ot_stat_code(rate_code)
                         if ot_code not in overtime_hours:
                             overtime_hours[ot_code] = 0
                         overtime_hours[ot_code] += seg_hours
                         stats['total_ot_hours'] += seg_hours
-                        
                     else:
-                        # Split at 88-hour threshold
                         regular_portion = 88 - hours_before
                         ot_portion = seg_hours - regular_portion
-                        
-                        # Regular portion
                         if rate_code not in regular_hours:
                             regular_hours[rate_code] = 0
                         regular_hours[rate_code] += regular_portion
                         stats['total_regular_hours'] += regular_portion
-                        
-                        # OT portion
                         ot_code = get_ot_stat_code(rate_code)
                         if ot_code not in overtime_hours:
                             overtime_hours[ot_code] = 0
                         overtime_hours[ot_code] += ot_portion
                         stats['total_ot_hours'] += ot_portion
-                    
-                    # Update cumulative (only non-stat hours)
                     cumulative_regular_hours += seg_hours
-        
-        # Calculate PHP for this employee with 176-hour cap
+
+        # PHP calculation using Tab 3 data
         php_total_hours = 0
-        
         for stat_date in stat_dates:
             if stat_date not in lookback_data:
                 continue
-            
             lookback_df = lookback_data[stat_date]
             employee_lookback = lookback_df[lookback_df['Name'] == employee_name].copy()
-            
             if len(employee_lookback) == 0:
                 continue
-            
-            # Calculate regular wages with 176-hour cap
             total_hours = 0
             total_wages = 0
-            vacation_pct = 0.04  # Default
-            
+            vacation_pct = 0.04
             for _, lb_shift in employee_lookback.iterrows():
                 lb_hours = lb_shift['Duration']
                 lb_rate_code = lb_shift['Payroll Item']
                 lb_notes = lb_shift.get('Notes', '')
-                
                 if pd.isna(lb_hours) or lb_hours == 0:
                     continue
-                
-                # Skip stat/OT hours in lookback (only count regular hours)
-                if 'OT' in str(lb_rate_code) or 'STAT' in str(lb_rate_code):
-                    continue
-                
-                # Get rate and vacation %
-                rate = extract_rate_from_code(lb_rate_code)
                 vacation_pct = max(vacation_pct, extract_vacation_percent(lb_notes))
-                
                 total_hours += lb_hours
-            
-            # Cap at 176 hours (88 × 2 pay periods)
             capped_hours = min(total_hours, 176)
-            
-            # Calculate wages based on capped hours
-            # Use weighted average or primary rate
             if capped_hours > 0:
-                # Get primary rate from most common rate code in lookback
                 rate_codes = employee_lookback[
                     ~employee_lookback['Payroll Item'].str.contains('OT|STAT', na=False)
                 ]['Payroll Item'].mode()
-                
                 if len(rate_codes) > 0:
                     primary_rate = extract_rate_from_code(rate_codes.iloc[0])
                     total_wages = capped_hours * primary_rate
-                
-                # Calculate PHP: (wages + vacation) / 20 / 30 (to get hours)
                 if total_wages > 0:
                     php_dollars = (total_wages * (1 + vacation_pct)) / 20
-                    php_hours = php_dollars / 30  # Convert to hours at $30/hr
+                    php_hours = php_dollars / 30
                     php_total_hours += php_hours
-        
-        # Create consolidated rows for this employee
+
         for rate_code, hours in regular_hours.items():
-            processed_rows.append({
-                'Name': employee_name,
-                'Transaction Date': first_date,
-                'Customer': 'STAR TOTAL',
-                'Service Item': 'Labor',
-                'Payroll Item': rate_code,
-                'Duration': round(hours, 2),
-                'Class': '',
-                'Billable': 'N',
-                'Notes': ''
-            })
+            processed_rows.append({'Name': employee_name, 'Transaction Date': first_date, 'Customer': 'STAR TOTAL', 'Service Item': 'Labor', 'Payroll Item': rate_code, 'Duration': round(hours, 2), 'Class': '', 'Billable': 'N', 'Notes': ''})
             stats['output_lines'] += 1
-        
         for rate_code, hours in overtime_hours.items():
-            processed_rows.append({
-                'Name': employee_name,
-                'Transaction Date': first_date,
-                'Customer': 'STAR TOTAL',
-                'Service Item': 'Labor',
-                'Payroll Item': rate_code,
-                'Duration': round(hours, 2),
-                'Class': '',
-                'Billable': 'N',
-                'Notes': ''
-            })
+            processed_rows.append({'Name': employee_name, 'Transaction Date': first_date, 'Customer': 'STAR TOTAL', 'Service Item': 'Labor', 'Payroll Item': rate_code, 'Duration': round(hours, 2), 'Class': '', 'Billable': 'N', 'Notes': ''})
             stats['output_lines'] += 1
-        
         for rate_code, hours in stat_hours.items():
-            processed_rows.append({
-                'Name': employee_name,
-                'Transaction Date': first_date,
-                'Customer': 'STAR TOTAL',
-                'Service Item': 'Labor',
-                'Payroll Item': rate_code,
-                'Duration': round(hours, 2),
-                'Class': '',
-                'Billable': 'N',
-                'Notes': ''
-            })
+            processed_rows.append({'Name': employee_name, 'Transaction Date': first_date, 'Customer': 'STAR TOTAL', 'Service Item': 'Labor', 'Payroll Item': rate_code, 'Duration': round(hours, 2), 'Class': '', 'Billable': 'N', 'Notes': ''})
             stats['output_lines'] += 1
-        
-        # Add PHP if applicable
         if php_total_hours > 0:
-            # Use first stat date in period for PHP line
             php_date = min([sd for sd in stat_dates if period_start <= sd <= period_end])
-            
-            processed_rows.append({
-                'Name': employee_name,
-                'Transaction Date': php_date,
-                'Customer': 'STAR TOTAL',
-                'Service Item': 'Labor',
-                'Payroll Item': 'PHP (Holiday)',
-                'Duration': round(php_total_hours, 2),
-                'Class': '',
-                'Billable': 'N',
-                'Notes': ''
-            })
+            processed_rows.append({'Name': employee_name, 'Transaction Date': php_date, 'Customer': 'STAR TOTAL', 'Service Item': 'Labor', 'Payroll Item': 'PHP (Holiday)', 'Duration': round(php_total_hours, 2), 'Class': '', 'Billable': 'N', 'Notes': ''})
             stats['output_lines'] += 1
             stats['total_php_hours'] += php_total_hours
-    
-    # Create output dataframe
+
     output_df = pd.DataFrame(processed_rows)
     if len(output_df) > 0:
         output_df = output_df.sort_values(['Name', 'Payroll Item']).reset_index(drop=True)
-    
-    # Add PHP warnings to stats
     stats['php_warnings'] = php_warnings
-    
     return output_df, stats
+
 
 def process_payroll_data(df):
     """
@@ -838,7 +661,7 @@ def to_excel(df):
 # MAIN APP
 # ============================================================================
 
-st.title("⭐ Star Security - Payroll Tools v4.0")
+st.title("⭐ Star Security - Payroll Tools v4.4")
 st.markdown("**Professional Payroll Processing with Time-Based Stat Splitting**")
 
 # Create tabs
@@ -857,7 +680,7 @@ with tab1:
         uploaded_file_tab1 = st.file_uploader(
             "Choose your Excel file (.xlsx)",
             type=['xlsx'],
-            help="Tab 1 = Current Payroll (required), Tab 2 = Times for PHP & Stat Splitting (optional), Tab 3 = Past Payroll for Rate Lookup (optional)",
+            help="Tab 1 = Current Payroll (required) | Tab 2 = Stat overnight times only - Name, Date, Start, End | Tab 3 = PHP lookback - paste 2 previous periods in payroll format",
             key="payroll_uploader"
         )
     
@@ -871,7 +694,7 @@ with tab1:
     if uploaded_file_tab1 is not None:
         try:
             # Load Excel file (one or two tabs)
-            payroll_df, times_df, past_payroll_df = load_two_tab_excel(uploaded_file_tab1)
+            payroll_df, times_df, php_lookback_df = load_two_tab_excel(uploaded_file_tab1)
             
             if payroll_df is None:
                 st.error("Failed to load Excel file")
@@ -889,11 +712,11 @@ with tab1:
                 else:
                     st.info("ℹ️ Single-tab format detected (no time splitting)")
                 
-                if past_payroll_df is not None:
-                    with st.expander("📂 View Past Payroll (Tab 3 - Rate Lookup)"):
-                        past_preview = normalize_payroll_dataframe(past_payroll_df.copy())
-                        st.dataframe(past_preview.head(20), use_container_width=True, height=200)
-                        st.success(f"✓ Past payroll loaded ({past_preview['Name'].nunique()} employees) - will be used for PHP rate lookup")
+                if php_lookback_df is not None:
+                    with st.expander("📂 View PHP Lookback Data (Tab 3 - 2 Previous Periods)"):
+                        php_preview = normalize_payroll_dataframe(php_lookback_df.copy())
+                        st.dataframe(php_preview.head(20), use_container_width=True, height=200)
+                        st.success(f"✓ PHP lookback loaded: {php_preview['Name'].nunique()} employees, {php_preview['Duration'].sum():.1f} hours")
                 
                 # Configuration
                 st.markdown("---")
@@ -996,7 +819,7 @@ with tab1:
                                     pd.to_datetime(period_start),
                                     pd.to_datetime(period_end),
                                     stat_configs,
-                                    past_payroll_df
+                                    php_lookback_df
                                 )
                             else:
                                 # Regular processing
@@ -1186,7 +1009,7 @@ with tab2:
 with st.sidebar:
     st.header("📋 About")
     st.markdown("""
-    **Star Security Payroll Tools v4.0**
+    **Star Security Payroll Tools v4.4**
     
     **Tab 1: Payroll Finisher**
     - Two-tab Excel support
@@ -1213,5 +1036,5 @@ with st.sidebar:
     
     ---
     
-    Star Security Inc. | v4.0
+    Star Security Inc. | v4.4
     """)
