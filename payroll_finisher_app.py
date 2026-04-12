@@ -232,7 +232,6 @@ def normalize_payroll_dataframe(df):
     return df
 
 def create_times_lookup(times_df):
-    """Create lookup dict — supports multiple shifts per (name, date)"""
     if times_df is None:
         return {}
     times_dict = {}
@@ -243,14 +242,14 @@ def create_times_lookup(times_df):
     times_df['Transaction Date'] = pd.to_datetime(times_df['Transaction Date'])
     for _, row in times_df.iterrows():
         name = row.get('Name', '')
-        date = row.get('Transaction Date')
+        date_val = row.get('Transaction Date')
         start = row.get('Actual_Start')
         end = row.get('Actual_End')
-        if pd.notna(name) and pd.notna(date) and pd.notna(start) and pd.notna(end):
-            key = (str(name), date.date())
+        if pd.notna(name) and pd.notna(date_val) and pd.notna(start) and pd.notna(end):
+            key = (str(name), date_val.date())
+            # Only store if not already there — first entry wins
             if key not in times_dict:
-                times_dict[key] = []
-            times_dict[key].append({'start': start, 'end': end})
+                times_dict[key] = {'start': start, 'end': end}
     return times_dict
 
 def process_payroll_data_with_stats(df, times_df, period_start, period_end, stat_configs, php_lookback_df=None):
@@ -345,17 +344,13 @@ def process_payroll_data_with_stats(df, times_df, period_start, period_end, stat
                 continue
             if 'OT' in str(rate_code) or 'STAT' in str(rate_code) or 'PHP' in str(rate_code):
                 continue
-            # Tab 2 lookup - handle multiple shifts per day
             lookup_key = (str(employee_name), shift_date.date())
-            shift_segments = []
+            start_time = None
+            end_time = None
             if lookup_key in times_dict:
-                for time_entry in times_dict[lookup_key]:
-                    segs = split_shift_with_times(shift_date, time_entry['start'], time_entry['end'], shift_hours, stat_dates, times_dict)
-                    shift_segments.extend(segs)
-                if not shift_segments:
-                    shift_segments = [(shift_date.date(), shift_hours, any(shift_date.date() == sd.date() for sd in stat_dates))]
-            else:
-                shift_segments = split_shift_with_times(shift_date, None, None, shift_hours, stat_dates, times_dict)
+                start_time = times_dict[lookup_key]['start']
+                end_time = times_dict[lookup_key]['end']
+            shift_segments = split_shift_with_times(shift_date, start_time, end_time, shift_hours, stat_dates, times_dict)
             for seg_date, seg_hours, is_stat in shift_segments:
                 if is_stat:
                     ot_stat_code = get_ot_stat_code(rate_code)
