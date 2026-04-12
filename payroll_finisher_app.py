@@ -494,8 +494,7 @@ def process_payroll_data_with_stats(df, times_df, period_start, period_end, stat
     output_df = pd.DataFrame(processed_rows)
     if len(output_df) > 0:
         output_df = output_df.sort_values(['Name', 'Payroll Item']).reset_index(drop=True)
-    # Clear warnings since we now calculate PHP for all eligible employees
-    stats['php_warnings'] = []
+    stats['php_warnings'] = php_warnings
     return output_df, stats
 
 
@@ -920,7 +919,7 @@ with tab1:
                     # Display PHP warnings if any
                     if 'php_warnings' in stats and len(stats['php_warnings']) > 0:
                         st.info(f"ℹ️ PHP included for {len(stats['php_warnings'])} employees who worked in the lookback period but not in the current period. Review before QuickBooks upload.")
-                        with st.expander(f"📋 View {len(stats['php_warnings'])} Employees Missing PHP"):
+                        with st.expander(f"📋 View {len(stats['php_warnings'])} Employees — PHP Included"):
                             warning_text = "**These employees worked during the PHP lookback period but are NOT in the current payroll period.**\n\n"
                             warning_text += "**Possible reasons:**\n"
                             warning_text += "- Employee on vacation during payroll period\n"
