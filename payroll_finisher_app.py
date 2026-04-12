@@ -247,9 +247,10 @@ def create_times_lookup(times_df):
         end = row.get('Actual_End')
         if pd.notna(name) and pd.notna(date_val) and pd.notna(start) and pd.notna(end):
             key = (str(name), date_val.date())
-            # Only store if not already there — first entry wins
+            hrs = row.get('Actual_Total_calc', None)
             if key not in times_dict:
-                times_dict[key] = {'start': start, 'end': end}
+                times_dict[key] = []
+            times_dict[key].append({'start': start, 'end': end, 'hours': hrs})
     return times_dict
 
 def process_payroll_data_with_stats(df, times_df, period_start, period_end, stat_configs, php_lookback_df=None):
@@ -348,8 +349,14 @@ def process_payroll_data_with_stats(df, times_df, period_start, period_end, stat
             start_time = None
             end_time = None
             if lookup_key in times_dict:
-                start_time = times_dict[lookup_key]['start']
-                end_time = times_dict[lookup_key]['end']
+                entries = times_dict[lookup_key]
+                if len(entries) == 1:
+                    start_time = entries[0]['start']
+                    end_time = entries[0]['end']
+                else:
+                    best = min(entries, key=lambda e: abs((e['hours'] or 0) - shift_hours) if e['hours'] is not None else 999)
+                    start_time = best['start']
+                    end_time = best['end']
             shift_segments = split_shift_with_times(shift_date, start_time, end_time, shift_hours, stat_dates, times_dict)
             for seg_date, seg_hours, is_stat in shift_segments:
                 if is_stat:
