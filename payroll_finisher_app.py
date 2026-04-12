@@ -350,7 +350,7 @@ def process_payroll_data_with_stats(df, times_df, period_start, period_end, stat
             shift_segments = []
             if lookup_key in times_dict:
                 for time_entry in times_dict[lookup_key]:
-                    segs = split_shift_with_times(shift_date, time_entry['start'], time_entry['end'], time_entry['end'], stat_dates, times_dict)
+                    segs = split_shift_with_times(shift_date, time_entry['start'], time_entry['end'], shift_hours, stat_dates, times_dict)
                     shift_segments.extend(segs)
                 if not shift_segments:
                     shift_segments = [(shift_date.date(), shift_hours, any(shift_date.date() == sd.date() for sd in stat_dates))]
