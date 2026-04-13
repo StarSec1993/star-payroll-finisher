@@ -444,7 +444,7 @@ def process_payroll_data_with_stats(df, times_df, period_start, period_end, stat
 
     # ── PHP for employees in lookback but NOT in current period ──────────────
     # These employees are entitled to PHP — use their rate from Tab 3 lookback data
-    php_date = min([sd for sd in stat_dates if period_start <= sd <= period_end]) if stat_dates else None
+    php_date = min([sd for sd in stat_dates if period_start <= sd <= period_end]).strftime("%Y-%m-%d") if stat_dates else None
     period_names = set(period_df['Name'].unique())
     for stat_date in stat_dates:
         if stat_date not in lookback_data:
