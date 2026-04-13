@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Star Security Payroll Tools v4.6 - Two-Tab Excel with Time-Based Stat Splitting
+Star Security Payroll Tools v4.7 - Two-Tab Excel with Time-Based Stat Splitting
 Tab 1: Payroll Finisher (Overtime + Stat Holidays + PHP with 176-hour cap)
 Tab 2: Union Benefits Calculator
 """
@@ -427,17 +427,17 @@ def process_payroll_data_with_stats(df, times_df, period_start, period_end, stat
                     php_total_hours += php_hours
 
         for rate_code, hours in regular_hours.items():
-            processed_rows.append({'Name': employee_name, 'Transaction Date': first_date, 'Customer': 'STAR TOTAL', 'Service Item': 'Labor', 'Payroll Item': rate_code, 'Duration': round(hours, 2), 'Class': '', 'Billable': 'N', 'Notes': ''})
+            processed_rows.append({'Name': employee_name, 'Transaction Date': first_date, 'Customer': emp_customer, 'Service Item': 'Labor', 'Payroll Item': rate_code, 'Duration': round(hours, 2), 'Class': '', 'Billable': 'N', 'Notes': ''})
             stats['output_lines'] += 1
         for rate_code, hours in overtime_hours.items():
-            processed_rows.append({'Name': employee_name, 'Transaction Date': first_date, 'Customer': 'STAR TOTAL', 'Service Item': 'Labor', 'Payroll Item': rate_code, 'Duration': round(hours, 2), 'Class': '', 'Billable': 'N', 'Notes': ''})
+            processed_rows.append({'Name': employee_name, 'Transaction Date': first_date, 'Customer': emp_customer, 'Service Item': 'Labor', 'Payroll Item': rate_code, 'Duration': round(hours, 2), 'Class': '', 'Billable': 'N', 'Notes': ''})
             stats['output_lines'] += 1
         for rate_code, hours in stat_hours.items():
-            processed_rows.append({'Name': employee_name, 'Transaction Date': first_date, 'Customer': 'STAR TOTAL', 'Service Item': 'Labor', 'Payroll Item': rate_code, 'Duration': round(hours, 2), 'Class': '', 'Billable': 'N', 'Notes': ''})
+            processed_rows.append({'Name': employee_name, 'Transaction Date': first_date, 'Customer': emp_customer, 'Service Item': 'Labor', 'Payroll Item': rate_code, 'Duration': round(hours, 2), 'Class': '', 'Billable': 'N', 'Notes': ''})
             stats['output_lines'] += 1
         if php_total_hours > 0:
-            php_date = min([sd for sd in stat_dates if period_start <= sd <= period_end])
-            processed_rows.append({'Name': employee_name, 'Transaction Date': php_date, 'Customer': 'STAR TOTAL', 'Service Item': 'Labor', 'Payroll Item': 'PHP (Holiday)', 'Duration': round(php_total_hours, 2), 'Class': '', 'Billable': 'N', 'Notes': ''})
+            php_date = min([sd for sd in stat_dates if period_start <= sd <= period_end]).strftime('%Y-%m-%d')
+            processed_rows.append({'Name': employee_name, 'Transaction Date': php_date, 'Customer': emp_customer, 'Service Item': 'Labor', 'Payroll Item': 'PHP (Holiday)', 'Duration': round(php_total_hours, 2), 'Class': '', 'Billable': 'N', 'Notes': ''})
             stats['output_lines'] += 1
             stats['total_php_hours'] += php_total_hours
 
@@ -476,10 +476,11 @@ def process_payroll_data_with_stats(df, times_df, period_start, period_end, stat
                     if total_wages > 0 and php_date:
                         php_dollars = (total_wages * (1 + vacation_pct)) / 20
                         php_hours = php_dollars / 30
+                        lb_customer = 'STAR TOTAL'
                         processed_rows.append({
                             'Name': employee_name,
                             'Transaction Date': php_date,
-                            'Customer': 'STAR TOTAL',
+                            'Customer': lb_customer,
                             'Service Item': 'Labor',
                             'Payroll Item': 'PHP (Holiday)',
                             'Duration': round(php_hours, 2),
@@ -705,7 +706,7 @@ def to_excel(df):
 # MAIN APP
 # ============================================================================
 
-st.title("⭐ Star Security - Payroll Tools v4.6")
+st.title("⭐ Star Security - Payroll Tools v4.7")
 st.markdown("**Professional Payroll Processing with Time-Based Stat Splitting**")
 
 # Create tabs
@@ -1053,7 +1054,7 @@ with tab2:
 with st.sidebar:
     st.header("📋 About")
     st.markdown("""
-    **Star Security Payroll Tools v4.6**
+    **Star Security Payroll Tools v4.7**
     
     **Tab 1: Payroll Finisher**
     - Two-tab Excel support
@@ -1080,5 +1081,5 @@ with st.sidebar:
     
     ---
     
-    Star Security Inc. | v4.6
+    Star Security Inc. | v4.7
     """)
