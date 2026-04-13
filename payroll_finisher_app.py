@@ -335,7 +335,8 @@ def process_payroll_data_with_stats(df, times_df, period_start, period_end, stat
         regular_hours = {}
         overtime_hours = {}
         stat_hours = {}
-        first_date = employee_shifts['Transaction Date'].iloc[0]
+        first_date = employee_shifts['Transaction Date'].iloc[0].strftime('%Y-%m-%d')
+        emp_customer = 'TCHC' if 'Customer' in employee_shifts.columns and (employee_shifts['Customer'].astype(str).str.strip() == 'TCHC').any() else 'STAR TOTAL'
 
         for idx, shift in employee_shifts.iterrows():
             shift_hours = shift['Duration']
